@@ -1,0 +1,29 @@
+# --- secrets / session / runtime state (NEVER commit) ---
+*.db
+*.db-shm
+*.db-wal
+store/
+session/
+*.session
+.env
+claude_desktop_config.json
+
+# compiled bridge binary
+whatsapp-bridge/wabridge
+whatsapp-bridge/wabridge.*
+
+# logs & backups
+*.log
+*.err
+*.out
+*.bak
+*.bak2
+*.bak3
+*.bak-*
+*_repair.bak
+cmux-wa-heal-state.json
+
+# python / deps
+__pycache__/
+.venv/
+node_modules/
