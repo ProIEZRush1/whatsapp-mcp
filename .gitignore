@@ -27,3 +27,6 @@ cmux-wa-heal-state.json
 __pycache__/
 .venv/
 node_modules/
+
+# per-machine presence config (holds shared token)
+presence.json

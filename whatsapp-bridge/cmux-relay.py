@@ -32,6 +32,7 @@ Run it in a dedicated cmux terminal tab and keep that tab open:
 """
 import datetime
 import json
+import os
 import re
 import ssl
 import subprocess
@@ -173,6 +174,69 @@ def shabbat_end_label():
         return "el anochecer del sábado"
 
 
+# --- Presence heartbeat (multi-node coordination) --------------------------------
+# Publish which chats THIS node is actively reading/processing right now — i.e.
+# chats whose subscribed surface has a live Claude session. A peer node can then
+# defer to us on those chats. Config lives in presence.json next to this script
+# (per-machine, not committed); absent -> heartbeat disabled.
+def _load_presence_config():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "presence.json")
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except Exception:
+        return None
+    if cfg.get("node_id") and cfg.get("presence_url") and cfg.get("token"):
+        return cfg
+    return None
+
+
+PRESENCE = _load_presence_config()
+PRESENCE_INTERVAL = 15  # seconds between heartbeats
+_last_heartbeat = {"t": None}
+
+
+def _subscribed_surfaces():
+    """[(chat_jid, surface), ...] for cmux subscriptions, from the bridge."""
+    try:
+        with urllib.request.urlopen(BRIDGE + "/webhooks", timeout=5) as r:
+            data = json.load(r)
+    except Exception:
+        return []
+    out = []
+    for h in data.get("webhooks", []) or []:
+        if h.get("kind") == "cmux" and h.get("chat_jid") and h.get("target"):
+            out.append((h["chat_jid"], h["target"]))
+    return out
+
+
+def heartbeat_tick():
+    """Compute the chats we're actively processing (Claude live on their surface)
+    and publish them to the presence service."""
+    if not PRESENCE:
+        return
+    surf_live = {}
+    active = []
+    for chat, surface in _subscribed_surfaces():
+        if surface not in surf_live:
+            surf_live[surface] = claude_running(surface) is True
+        if surf_live[surface]:
+            active.append(chat)
+    try:
+        body = json.dumps({"node": PRESENCE["node_id"], "active_chats": active}).encode()
+        req = urllib.request.Request(
+            PRESENCE["presence_url"].rstrip("/") + "/hb", data=body,
+            headers={"Content-Type": "application/json",
+                     "X-Presence-Token": PRESENCE["token"],
+                     # Cloudflare 403s the default Python-urllib User-Agent.
+                     "User-Agent": "whatsapp-presence-relay/1.0"},
+            method="POST")
+        ctx = ssl.create_default_context()
+        urllib.request.urlopen(req, timeout=10, context=ctx).read()
+    except Exception as e:
+        print("[relay] heartbeat failed:", e, flush=True)
+
+
 def flatten(notice):
     # cmux `send` treats \n, \r and \t as key presses (Enter/Tab). WhatsApp
     # messages are often multi-line, so embedded newlines would submit the prompt
@@ -208,8 +272,16 @@ def send(surface, notice):
 
 def main():
     print("cmux-relay: draining WhatsApp cmux deliveries from", BRIDGE, flush=True)
+    if PRESENCE:
+        print(f"[relay] presence heartbeat on as node '{PRESENCE['node_id']}'", flush=True)
     was_shabbat = False
     while True:
+        # Publish which chats we're actively processing (throttled).
+        if PRESENCE:
+            now_m = time.monotonic()
+            if _last_heartbeat["t"] is None or now_m - _last_heartbeat["t"] >= PRESENCE_INTERVAL:
+                _last_heartbeat["t"] = now_m
+                heartbeat_tick()
         items = get_outbox()
         shab = is_shabbat()
         if not shab and was_shabbat:

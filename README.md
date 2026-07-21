@@ -6,8 +6,9 @@
 > - **Message edits** forwarded (WhatsApp `MESSAGE_EDIT` unwrapped)
 > - **Voice-note transcription** via local Whisper (`transcribe.py`, ffmpeg-path hardened)
 > - **cmux delivery relay** (`cmux-relay.py`): only delivers to a session when Claude is actually running there, holds otherwise — plus a **Shabbat hold** (Hebcal times) that queues messages during Shabbat and flushes after
+> - **Multi-node priority coordination** (`presence.json`): when two nodes share the same chats, the relay heartbeats which chats it's actively processing (Claude live), and a node can defer to a peer that's handling a chat — with a takeover timeout if the peer goes quiet. Copy `presence.json.example` → `presence.json`; omit the file to disable.
 >
-> The cmux relay + Shabbat pieces are optional (they need a cmux setup); the bridge + MCP features work standalone.
+> The cmux relay + Shabbat + presence pieces are optional (they need a cmux setup); the bridge + MCP features work standalone.
 
 This is a Model Context Protocol (MCP) server for WhatsApp.
 

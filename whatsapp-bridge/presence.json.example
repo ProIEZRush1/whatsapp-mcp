@@ -1,0 +1,10 @@
+{
+  "_comment": "Per-machine presence coordination. Copy to presence.json (gitignored). Leave the file out entirely to disable the feature.",
+  "node_id": "elias",
+  "presence_url": "https://amudehaolam.org/api/presence",
+  "token": "ASK_EDUARDO_FOR_THE_SHARED_TOKEN",
+  "priority_peer": "",
+  "priority_chats": [],
+  "peer_number": "",
+  "takeover_seconds": 90
+}

@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -452,6 +453,147 @@ func transcribeAudio(path string, logger waLog.Logger) string {
 func fileExists(p string) bool {
 	_, err := os.Stat(p)
 	return err == nil
+}
+
+// --- Presence-based priority coordination -------------------------------------
+// When two bot nodes share the same chats, one node can be given priority on
+// certain chats. This node then defers on those chats WHEN the peer is actively
+// processing them (per the presence service), and takes over only if the peer
+// doesn't reply within a timeout. Config is presence.json (per-machine, absent
+// -> feature off).
+
+type presenceCfg struct {
+	NodeID          string   `json:"node_id"`
+	PresenceURL     string   `json:"presence_url"`
+	Token           string   `json:"token"`
+	PriorityPeer    string   `json:"priority_peer"`   // node we defer to (empty -> never defer)
+	PriorityChats   []string `json:"priority_chats"`  // chats the peer leads
+	PeerNumber      string   `json:"peer_number"`     // peer's WhatsApp number (to detect their replies)
+	TakeoverSeconds int      `json:"takeover_seconds"`
+}
+
+var presence *presenceCfg
+var priorityChatSet = map[string]bool{}
+var peerLastMsg = struct {
+	sync.Mutex
+	m map[string]time.Time
+}{m: map[string]time.Time{}}
+
+func onlyDigits(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func loadPresenceConfig() {
+	path := "presence.json"
+	if wd, err := os.Getwd(); err == nil {
+		if p := filepath.Join(wd, "presence.json"); fileExists(p) {
+			path = p
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var c presenceCfg
+	if err := json.Unmarshal(data, &c); err != nil {
+		fmt.Println("presence.json parse error:", err)
+		return
+	}
+	if c.PresenceURL == "" || c.Token == "" || c.NodeID == "" {
+		return
+	}
+	if c.TakeoverSeconds <= 0 {
+		c.TakeoverSeconds = 90
+	}
+	for _, ch := range c.PriorityChats {
+		priorityChatSet[ch] = true
+	}
+	presence = &c
+	fmt.Printf("presence coordination on: node=%s peer=%s priorityChats=%d\n",
+		c.NodeID, c.PriorityPeer, len(c.PriorityChats))
+}
+
+// recordPeerMessage notes when the priority peer posts in a chat, so takeover can
+// tell whether the peer already answered.
+func recordPeerMessage(chatJID, sender string, ts time.Time) {
+	if presence == nil || presence.PeerNumber == "" {
+		return
+	}
+	if onlyDigits(sender) != onlyDigits(presence.PeerNumber) {
+		return
+	}
+	peerLastMsg.Lock()
+	peerLastMsg.m[chatJID] = ts
+	peerLastMsg.Unlock()
+}
+
+func peerRepliedAfter(chatJID string, t time.Time) bool {
+	peerLastMsg.Lock()
+	defer peerLastMsg.Unlock()
+	last, ok := peerLastMsg.m[chatJID]
+	return ok && last.After(t)
+}
+
+// peerActiveForChat asks the presence service whether the priority peer is
+// currently processing this chat. Fails OPEN (false) so a presence outage means
+// we answer rather than go silent.
+func peerActiveForChat(chatJID string) bool {
+	if presence == nil || presence.PriorityPeer == "" {
+		return false
+	}
+	u := fmt.Sprintf("%s/active?node=%s&chat=%s",
+		strings.TrimRight(presence.PresenceURL, "/"),
+		url.QueryEscape(presence.PriorityPeer), url.QueryEscape(chatJID))
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("X-Presence-Token", presence.Token)
+	resp, err := (&http.Client{Timeout: 6 * time.Second}).Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Active bool `json:"active"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&out) != nil {
+		return false
+	}
+	return out.Active
+}
+
+// gatedDispatch applies priority coordination before fanning a message out to
+// sessions. On a priority chat where the peer is actively processing, it holds
+// the message ~takeover seconds; if the peer posts a reply meanwhile it drops
+// the message, otherwise it takes over and dispatches.
+func gatedDispatch(client *whatsmeow.Client, store *MessageStore, p WebhookPayload, logger waLog.Logger) {
+	if presence == nil || p.IsFromMe || !priorityChatSet[p.ChatJID] {
+		dispatchWebhooks(client, store, p, logger)
+		return
+	}
+	if !peerActiveForChat(p.ChatJID) {
+		dispatchWebhooks(client, store, p, logger) // peer offline -> we answer
+		return
+	}
+	arrival := time.Now()
+	d := time.Duration(presence.TakeoverSeconds) * time.Second
+	logger.Infof("[priority] %s: peer '%s' active — holding %s for takeover", p.ChatJID, presence.PriorityPeer, d)
+	go func() {
+		time.Sleep(d)
+		if peerRepliedAfter(p.ChatJID, arrival) {
+			logger.Infof("[priority] %s handled by peer — skipping", p.ChatJID)
+			return
+		}
+		logger.Infof("[priority] peer silent on %s — taking over", p.ChatJID)
+		dispatchWebhooks(client, store, p, logger)
+	}()
 }
 
 // dispatchWebhooks: only subscribed chats get processed. Everything for a
@@ -1177,6 +1319,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	sender := msg.Info.Sender.User
 	senderName := senderDisplayName(client, msg)
 
+	// Note when the priority peer posts here, so takeover can tell if they answered.
+	recordPeerMessage(chatJID, sender, msg.Info.Timestamp)
+
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, chatObj, chatJID, nil, sender, logger)
 
@@ -1312,8 +1457,10 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
 
-		// Push this message to any subscribed sessions (async, non-blocking)
-		dispatchWebhooks(client, messageStore, WebhookPayload{
+		// Push this message to any subscribed sessions (async, non-blocking).
+		// gatedDispatch applies priority coordination (defer to a peer node that
+		// is actively processing this chat); it's a pass-through when off.
+		gatedDispatch(client, messageStore, WebhookPayload{
 			Event:         "message",
 			MessageID:     msg.Info.ID,
 			ChatJID:       chatJID,
@@ -1992,6 +2139,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 }
 
 func main() {
+	loadPresenceConfig()
 	// Single-instance guard: if another bridge already holds the REST port,
 	// exit immediately WITHOUT connecting to WhatsApp. Two bridges sharing the
 	// same linked-device session trigger a "stream replaced" war that
