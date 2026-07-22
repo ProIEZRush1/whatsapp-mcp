@@ -569,17 +569,92 @@ func peerActiveForChat(chatJID string) bool {
 	return out.Active
 }
 
+// contextStale marks chats where we skipped ≥1 message (the peer handled it) since
+// our last delivery. When we next deliver here, we first send the recent history
+// as a CONTEXT-ONLY block so the taking-over session has the thread.
+var contextStale = struct {
+	sync.Mutex
+	m map[string]bool
+}{m: map[string]bool{}}
+
+func markContextStale(chatJID string) {
+	contextStale.Lock()
+	contextStale.m[chatJID] = true
+	contextStale.Unlock()
+}
+
+// takeContextStale returns true and clears the flag if the chat had skipped messages.
+func takeContextStale(chatJID string) bool {
+	contextStale.Lock()
+	defer contextStale.Unlock()
+	if contextStale.m[chatJID] {
+		delete(contextStale.m, chatJID)
+		return true
+	}
+	return false
+}
+
+// deliverContextBacklog enqueues the chat's recent history to subscribed sessions
+// as a DO-NOT-PROCESS context block, so a session taking over understands the
+// thread the peer was handling.
+func deliverContextBacklog(store *MessageStore, chatJID, chatName string, logger waLog.Logger) {
+	hooks, err := store.getWebhooksForChat(chatJID)
+	if err != nil || len(hooks) == 0 {
+		return
+	}
+	msgs, err := store.GetMessages(chatJID, 25) // newest-first
+	if err != nil || len(msgs) == 0 {
+		return
+	}
+	var b strings.Builder
+	b.WriteString("🧩 CONTEXTO — NO RESPONDER / NO PROCESAR. Es solo el historial reciente de \"")
+	b.WriteString(chatName)
+	b.WriteString("\" que atendió el otro nodo mientras este chat estaba en pausa. Léelo para tener contexto del siguiente mensaje; NO contestes a esto:")
+	for i := len(msgs) - 1; i >= 0; i-- { // oldest -> newest
+		m := msgs[i]
+		who := m.Sender
+		if m.IsFromMe {
+			who = "Yo"
+		} else if presence != nil && presence.PeerNumber != "" && onlyDigits(m.Sender) == onlyDigits(presence.PeerNumber) {
+			who = presence.PriorityPeer
+		}
+		content := m.Content
+		if content == "" && m.MediaType != "" {
+			content = "[" + m.MediaType + "]"
+		}
+		if content == "" {
+			continue
+		}
+		b.WriteString(" | " + who + ": " + content)
+	}
+	notice := strings.ReplaceAll(strings.ReplaceAll(b.String(), "\n", " "), "\r", " ")
+	for _, h := range hooks {
+		if h.Kind == "cmux" {
+			if err := store.EnqueueCmux(h.Target, notice); err != nil {
+				logger.Warnf("context backlog enqueue failed for %s: %v", h.Target, err)
+			}
+		}
+	}
+	logger.Infof("[priority] delivered context backlog for %s (%d msgs)", chatJID, len(msgs))
+}
+
 // gatedDispatch applies priority coordination before fanning a message out to
 // sessions. On a priority chat where the peer is actively processing, it holds
 // the message ~takeover seconds; if the peer posts a reply meanwhile it drops
-// the message, otherwise it takes over and dispatches.
+// the message (marking the chat context-stale), otherwise it takes over. Whenever
+// it delivers after having skipped messages, it first back-fills the history as
+// a do-not-process context block.
 func gatedDispatch(client *whatsmeow.Client, store *MessageStore, p WebhookPayload, logger waLog.Logger) {
 	if presence == nil || p.IsFromMe || !priorityChatSet[p.ChatJID] {
 		dispatchWebhooks(client, store, p, logger)
 		return
 	}
 	if !peerActiveForChat(p.ChatJID) {
-		dispatchWebhooks(client, store, p, logger) // peer offline -> we answer
+		// peer offline -> we answer; back-fill context if we skipped messages here.
+		if takeContextStale(p.ChatJID) {
+			deliverContextBacklog(store, p.ChatJID, p.ChatName, logger)
+		}
+		dispatchWebhooks(client, store, p, logger)
 		return
 	}
 	arrival := time.Now()
@@ -588,8 +663,12 @@ func gatedDispatch(client *whatsmeow.Client, store *MessageStore, p WebhookPaylo
 	go func() {
 		time.Sleep(d)
 		if peerRepliedAfter(p.ChatJID, arrival) {
-			logger.Infof("[priority] %s handled by peer — skipping", p.ChatJID)
+			markContextStale(p.ChatJID) // peer handled it; remember to back-fill later
+			logger.Infof("[priority] %s handled by peer — skipping (marked context-stale)", p.ChatJID)
 			return
+		}
+		if takeContextStale(p.ChatJID) {
+			deliverContextBacklog(store, p.ChatJID, p.ChatName, logger)
 		}
 		logger.Infof("[priority] peer silent on %s — taking over", p.ChatJID)
 		dispatchWebhooks(client, store, p, logger)
@@ -953,6 +1032,13 @@ type MarkReadRequest struct {
 type PresenceRequest struct {
 	Recipient string `json:"recipient"`
 	State     string `json:"state"`
+}
+
+// GroupParticipantsRequest is the body for /api/group-participants
+type GroupParticipantsRequest struct {
+	GroupJID     string   `json:"group_jid"`
+	Participants []string `json:"participants"` // phone numbers or JIDs
+	Action       string   `json:"action"`       // add | remove | promote | demote
 }
 
 // parseRecipientJID turns a phone number or JID string into a types.JID.
@@ -1837,6 +1923,124 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			"success": true,
 			"group":   info.Name,
 			"members": members,
+		})
+	})
+
+	// Handler for adding/removing/promoting/demoting group members.
+	// POST /api/group-participants
+	//   { "group_jid":"…@g.us", "participants":["<number or jid>",…], "action":"add|remove|promote|demote" }
+	// Requires that this account is an admin of the group (WhatsApp enforces it
+	// server-side). Returns a per-participant result so the caller sees who
+	// succeeded vs. who failed (e.g. not on WhatsApp, privacy-blocked).
+	http.HandleFunc("/api/group-participants", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req GroupParticipantsRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if req.GroupJID == "" || len(req.Participants) == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "group_jid and participants are required"})
+			return
+		}
+
+		var action whatsmeow.ParticipantChange
+		switch req.Action {
+		case "add":
+			action = whatsmeow.ParticipantChangeAdd
+		case "remove":
+			action = whatsmeow.ParticipantChangeRemove
+		case "promote":
+			action = whatsmeow.ParticipantChangePromote
+		case "demote":
+			action = whatsmeow.ParticipantChangeDemote
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "action must be add, remove, promote or demote"})
+			return
+		}
+
+		groupJID, err := types.ParseJID(req.GroupJID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "invalid group_jid"})
+			return
+		}
+
+		// A value with "@" is a JID (verbatim, so "<lid>@lid" passes through); a
+		// bare value is normalized to digits -> "<number>@s.whatsapp.net". For ADD,
+		// prefer the phone form (resolution-free); for REMOVE in LID groups pass the
+		// member's jid from /api/group-members.
+		participantJIDs := make([]types.JID, 0, len(req.Participants))
+		for _, p := range req.Participants {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			if strings.Contains(p, "@") {
+				pj, perr := types.ParseJID(p)
+				if perr != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					json.NewEncoder(w).Encode(map[string]any{"success": false, "error": fmt.Sprintf("invalid participant %q: %v", p, perr)})
+					return
+				}
+				participantJIDs = append(participantJIDs, pj)
+			} else if n := onlyDigits(p); n != "" {
+				participantJIDs = append(participantJIDs, types.JID{User: n, Server: "s.whatsapp.net"})
+			}
+		}
+		if len(participantJIDs) == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "no valid participants"})
+			return
+		}
+
+		updated, err := client.UpdateGroupParticipants(context.Background(), groupJID, participantJIDs, action)
+		if err != nil {
+			// Whole-call failure: usually not-admin (403), not-logged-in, or network.
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "error": err.Error()})
+			return
+		}
+
+		// Per-participant outcome: Error==0 is success; non-zero is that member's
+		// server code (408 not on WhatsApp, 409 already in, 403 privacy, 401 blocked).
+		// A 403 with an AddRequest means a direct add was refused and an invite must
+		// be sent instead — surface its code so the caller knows.
+		type ppResult struct {
+			JID        string `json:"jid"`
+			Phone      string `json:"phone"`
+			Success    bool   `json:"success"`
+			Code       int    `json:"code"`
+			InviteCode string `json:"invite_code,omitempty"`
+		}
+		results := make([]ppResult, 0, len(updated))
+		for _, p := range updated {
+			phone := p.PhoneNumber.User
+			if phone == "" {
+				phone = p.JID.User
+			}
+			res := ppResult{
+				JID:     p.JID.String(),
+				Phone:   phone,
+				Success: p.Error == 0,
+				Code:    p.Error,
+			}
+			if p.AddRequest != nil {
+				res.InviteCode = p.AddRequest.Code
+			}
+			results = append(results, res)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"action":  req.Action,
+			"group":   groupJID.String(),
+			"results": results,
 		})
 	})
 

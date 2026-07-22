@@ -689,6 +689,46 @@ def list_group_members(group_jid: str) -> Tuple[bool, Any]:
         return False, f"Unexpected error: {str(e)}"
 
 
+def _modify_group_participants(group_jid: str, participants: List[str],
+                               action: str) -> Tuple[bool, Any]:
+    """Add or remove members of a WhatsApp group via the Go bridge (you must be a
+    group admin). Returns (success, per-participant result list) or (False, error)."""
+    try:
+        if not group_jid or "@g.us" not in group_jid:
+            return False, "A group JID (…@g.us) is required"
+        if action not in ("add", "remove"):
+            return False, "action must be 'add' or 'remove'"
+        if not participants:
+            return False, "At least one participant is required"
+        url = f"{WHATSAPP_API_BASE_URL}/group-participants"
+        payload = {"group_jid": group_jid, "action": action, "participants": participants}
+        response = requests.post(url, json=payload, timeout=BRIDGE_TIMEOUT)
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("success"):
+                return True, result.get("results", [])
+            return False, result.get("error", "Unknown error")
+        return False, f"Error: HTTP {response.status_code} - {response.text}"
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+
+def add_group_participants(group_jid: str, participants: List[str]) -> Tuple[bool, Any]:
+    """Add members to a WhatsApp group (requires you are a group admin). The
+    `participants` are phone numbers (digits only, no +) or full JIDs."""
+    return _modify_group_participants(group_jid, participants, "add")
+
+
+def remove_group_participants(group_jid: str, participants: List[str]) -> Tuple[bool, Any]:
+    """Remove members from a WhatsApp group (requires you are a group admin). The
+    `participants` are phone numbers (digits only, no +) or full JIDs."""
+    return _modify_group_participants(group_jid, participants, "remove")
+
+
 def send_message(recipient: str, message: str, reply_to: Optional[str] = None,
                  reply_participant: Optional[str] = None,
                  reply_text: Optional[str] = None,

@@ -11,6 +11,8 @@ from whatsapp import (
     get_message_context as whatsapp_get_message_context,
     send_message as whatsapp_send_message,
     list_group_members as whatsapp_list_group_members,
+    add_group_participants as whatsapp_add_group_participants,
+    remove_group_participants as whatsapp_remove_group_participants,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media,
@@ -228,6 +230,52 @@ def list_group_members(group_jid: str) -> Dict[str, Any]:
     success, result = whatsapp_list_group_members(group_jid)
     if success:
         return {"success": True, "members": result}
+    return {"success": False, "message": result}
+
+@mcp.tool()
+def add_group_participants(group_jid: str, participants: List[str]) -> Dict[str, Any]:
+    """Add one or more people to a WhatsApp group. You MUST be an admin of the group.
+
+    Each result reports whether that person was added; a non-zero `code` means a
+    failure (408 = not on WhatsApp, 409 = already in the group, 403 = blocked by
+    their privacy settings — an `invite_code` may be returned to invite instead).
+
+    Args:
+        group_jid: The group JID, e.g. "123456789@g.us"
+        participants: Numbers to add — international numbers, digits only, no + or
+                 symbols (e.g. ["5215551091852"]). Full JIDs are also accepted.
+
+    Returns:
+        A dictionary with success status and, on success, a `participants` list of
+        per-number outcomes; on failure a `message`.
+    """
+    if not group_jid or not participants:
+        return {"success": False, "message": "group_jid and at least one participant are required"}
+    success, result = whatsapp_add_group_participants(group_jid, participants)
+    if success:
+        return {"success": True, "participants": result}
+    return {"success": False, "message": result}
+
+@mcp.tool()
+def remove_group_participants(group_jid: str, participants: List[str]) -> Dict[str, Any]:
+    """Remove one or more people from a WhatsApp group. You MUST be an admin of the group.
+
+    Args:
+        group_jid: The group JID, e.g. "123456789@g.us"
+        participants: Numbers to remove — international numbers, digits only, no +
+                 or symbols (e.g. ["5215551091852"]). Full JIDs are also accepted.
+                 Use list_group_members to resolve a member's name to their number
+                 (or their jid, which is more reliable for privacy/LID groups).
+
+    Returns:
+        A dictionary with success status and, on success, a `participants` list of
+        per-number outcomes; on failure a `message`.
+    """
+    if not group_jid or not participants:
+        return {"success": False, "message": "group_jid and at least one participant are required"}
+    success, result = whatsapp_remove_group_participants(group_jid, participants)
+    if success:
+        return {"success": True, "participants": result}
     return {"success": False, "message": result}
 
 @mcp.tool()
