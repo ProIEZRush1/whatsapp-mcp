@@ -466,14 +466,18 @@ type presenceCfg struct {
 	NodeID          string   `json:"node_id"`
 	PresenceURL     string   `json:"presence_url"`
 	Token           string   `json:"token"`
-	PriorityPeer    string   `json:"priority_peer"`   // node we defer to (empty -> never defer)
-	PriorityChats   []string `json:"priority_chats"`  // chats the peer leads
-	PeerNumber      string   `json:"peer_number"`     // peer's WhatsApp number (to detect their replies)
+	PriorityPeer    string   `json:"priority_peer"`   // single peer (legacy); prefer priority_peers
+	PriorityPeers   []string `json:"priority_peers"`  // nodes we defer to (any active -> defer)
+	PriorityChats   []string `json:"priority_chats"`  // chats the peers lead
+	PeerNumber      string   `json:"peer_number"`     // single peer number (legacy); prefer peer_numbers
+	PeerNumbers     []string `json:"peer_numbers"`    // peers' WhatsApp numbers (to detect their replies)
 	TakeoverSeconds int      `json:"takeover_seconds"`
 }
 
 var presence *presenceCfg
 var priorityChatSet = map[string]bool{}
+var priorityPeers []string          // node ids we defer to
+var peerNumberSet = map[string]bool{} // digits-only peer numbers, for reply detection
 var peerLastMsg = struct {
 	sync.Mutex
 	m map[string]time.Time
@@ -514,18 +518,28 @@ func loadPresenceConfig() {
 	for _, ch := range c.PriorityChats {
 		priorityChatSet[ch] = true
 	}
+	// Merge legacy single fields into the plural lists.
+	priorityPeers = append([]string{}, c.PriorityPeers...)
+	if c.PriorityPeer != "" {
+		priorityPeers = append(priorityPeers, c.PriorityPeer)
+	}
+	for _, n := range append(append([]string{}, c.PeerNumbers...), c.PeerNumber) {
+		if d := onlyDigits(n); d != "" {
+			peerNumberSet[d] = true
+		}
+	}
 	presence = &c
-	fmt.Printf("presence coordination on: node=%s peer=%s priorityChats=%d\n",
-		c.NodeID, c.PriorityPeer, len(c.PriorityChats))
+	fmt.Printf("presence coordination on: node=%s peers=%v priorityChats=%d peerNumbers=%d\n",
+		c.NodeID, priorityPeers, len(c.PriorityChats), len(peerNumberSet))
 }
 
-// recordPeerMessage notes when the priority peer posts in a chat, so takeover can
-// tell whether the peer already answered.
+// recordPeerMessage notes when ANY priority peer posts in a chat, so takeover can
+// tell whether a peer already answered.
 func recordPeerMessage(chatJID, sender string, ts time.Time) {
-	if presence == nil || presence.PeerNumber == "" {
+	if presence == nil || len(peerNumberSet) == 0 {
 		return
 	}
-	if onlyDigits(sender) != onlyDigits(presence.PeerNumber) {
+	if !peerNumberSet[onlyDigits(sender)] {
 		return
 	}
 	peerLastMsg.Lock()
@@ -540,33 +554,40 @@ func peerRepliedAfter(chatJID string, t time.Time) bool {
 	return ok && last.After(t)
 }
 
-// peerActiveForChat asks the presence service whether the priority peer is
+// peerActiveForChat asks the presence service whether ANY priority peer is
 // currently processing this chat. Fails OPEN (false) so a presence outage means
 // we answer rather than go silent.
 func peerActiveForChat(chatJID string) bool {
-	if presence == nil || presence.PriorityPeer == "" {
+	if presence == nil || len(priorityPeers) == 0 {
 		return false
 	}
-	u := fmt.Sprintf("%s/active?node=%s&chat=%s",
-		strings.TrimRight(presence.PresenceURL, "/"),
-		url.QueryEscape(presence.PriorityPeer), url.QueryEscape(chatJID))
-	req, err := http.NewRequest(http.MethodGet, u, nil)
-	if err != nil {
-		return false
+	client := &http.Client{Timeout: 6 * time.Second}
+	for _, peer := range priorityPeers {
+		if peer == "" {
+			continue
+		}
+		u := fmt.Sprintf("%s/active?node=%s&chat=%s",
+			strings.TrimRight(presence.PresenceURL, "/"),
+			url.QueryEscape(peer), url.QueryEscape(chatJID))
+		req, err := http.NewRequest(http.MethodGet, u, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("X-Presence-Token", presence.Token)
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		var out struct {
+			Active bool `json:"active"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&out)
+		resp.Body.Close()
+		if err == nil && out.Active {
+			return true // some peer is handling this chat
+		}
 	}
-	req.Header.Set("X-Presence-Token", presence.Token)
-	resp, err := (&http.Client{Timeout: 6 * time.Second}).Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	var out struct {
-		Active bool `json:"active"`
-	}
-	if json.NewDecoder(resp.Body).Decode(&out) != nil {
-		return false
-	}
-	return out.Active
+	return false
 }
 
 // contextStale marks chats where we skipped ≥1 message (the peer handled it) since
@@ -615,8 +636,8 @@ func deliverContextBacklog(store *MessageStore, chatJID, chatName string, logger
 		who := m.Sender
 		if m.IsFromMe {
 			who = "Yo"
-		} else if presence != nil && presence.PeerNumber != "" && onlyDigits(m.Sender) == onlyDigits(presence.PeerNumber) {
-			who = presence.PriorityPeer
+		} else if peerNumberSet[onlyDigits(m.Sender)] {
+			who = "colega" // a priority peer (Jose/Elias) handled this
 		}
 		content := m.Content
 		if content == "" && m.MediaType != "" {
@@ -659,7 +680,7 @@ func gatedDispatch(client *whatsmeow.Client, store *MessageStore, p WebhookPaylo
 	}
 	arrival := time.Now()
 	d := time.Duration(presence.TakeoverSeconds) * time.Second
-	logger.Infof("[priority] %s: peer '%s' active — holding %s for takeover", p.ChatJID, presence.PriorityPeer, d)
+	logger.Infof("[priority] %s: a peer %v active — holding %s for takeover", p.ChatJID, priorityPeers, d)
 	go func() {
 		time.Sleep(d)
 		if peerRepliedAfter(p.ChatJID, arrival) {

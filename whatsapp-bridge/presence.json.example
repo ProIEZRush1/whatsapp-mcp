@@ -1,10 +1,10 @@
 {
-  "_comment": "Per-machine presence coordination. Copy to presence.json (gitignored). Leave the file out entirely to disable the feature.",
-  "node_id": "elias",
+  "_comment": "Copia a presence.json (gitignored). PEER (Jose/Elias): solo pon node_id + presence_url + token; NO pongas priority_*. El nodo que DEFIERE (Eduardo) sí pone priority_peers/priority_chats/peer_numbers.",
+  "node_id": "jose",
   "presence_url": "https://amudehaolam.org/api/presence",
-  "token": "ASK_EDUARDO_FOR_THE_SHARED_TOKEN",
-  "priority_peer": "",
+  "token": "PIDE_EL_TOKEN_A_EDUARDO",
+  "priority_peers": [],
   "priority_chats": [],
-  "peer_number": "",
+  "peer_numbers": [],
   "takeover_seconds": 90
 }

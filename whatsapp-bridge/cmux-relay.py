@@ -174,6 +174,72 @@ def shabbat_end_label():
         return "el anochecer del sábado"
 
 
+# --- Tishá BeAv one-off pause (Mexico City, UTC-6) -------------------------------
+# Like Shabbat: hold/queue everything and don't let the bot work. Additionally,
+# auto-reply once per chat so whoever writes knows it's the fast. The window
+# auto-expires: before/after these datetimes in_tisha_beav() is False and does
+# nothing. To repeat next year, update the two datetimes (or drive from Hebcal).
+TISHA_START = datetime.datetime.fromisoformat("2026-07-22T19:00:00-06:00")
+TISHA_END = datetime.datetime.fromisoformat("2026-07-23T13:00:00-06:00")
+TISHA_REPLY = (
+    "\U0001F56F️ *Tishá BeAv*. Hoy es el día de duelo por la destrucción del "
+    "Beit HaMikdash (el Sagrado Templo de Jerusalén). En señal de luto no trabajamos "
+    "durante el ayuno; con gusto te respondemos más tarde (~1:00 PM). Que muy "
+    "pronto merezcamos ver reconstruido el Beit HaMikdash. \U0001F64F")
+TISHA_SESSION_ANN = (
+    "\U0001F56F️ Tishá BeAv — en pausa (como Shabat) hasta ~1:00 PM de hoy. Guardo "
+    "los mensajes y te los entrego al terminar. A quien escribe se le responde "
+    "automáticamente que estamos en Tishá BeAv. No hace falta que contestes ahora.")
+_CHAT_JID_RE = re.compile(r"\[([^\]]+@[^\]]+)\]")
+_tisha_replied = set()    # chats already auto-replied this window
+_tisha_announced = set()  # surfaces already given the session heads-up
+
+
+def _load_pause_exempt():
+    """Surface IDs (uppercase CMUX_SURFACE_ID) exempt from the Shabbat/Tishá BeAv
+    hold — they deliver normally and their chats get no auto-reply. Read from
+    tisha_exempt.txt next to this script (one id per line, # comments). Reloaded
+    each cycle so edits take effect without a relay restart."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tisha_exempt.txt")
+    exempt = set()
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    exempt.add(line.upper())
+    except Exception:
+        pass
+    return exempt
+
+
+def in_tisha_beav():
+    try:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return TISHA_START <= now <= TISHA_END
+    except Exception:
+        return False
+
+
+def _chat_jid_from_notice(notice):
+    m = _CHAT_JID_RE.search(notice or "")
+    return m.group(1) if m else None
+
+
+def send_whatsapp(recipient, message):
+    """Send a WhatsApp message via the bridge (localhost, no Cloudflare)."""
+    try:
+        body = json.dumps({"recipient": recipient, "message": message}).encode()
+        req = urllib.request.Request(
+            BRIDGE + "/send", data=body,
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.load(r).get("success", False)
+    except Exception as e:
+        print("[relay] tisha auto-reply failed:", e, flush=True)
+        return False
+
+
 # --- Presence heartbeat (multi-node coordination) --------------------------------
 # Publish which chats THIS node is actively reading/processing right now — i.e.
 # chats whose subscribed surface has a live Claude session. A peer node can then
@@ -274,7 +340,7 @@ def main():
     print("cmux-relay: draining WhatsApp cmux deliveries from", BRIDGE, flush=True)
     if PRESENCE:
         print(f"[relay] presence heartbeat on as node '{PRESENCE['node_id']}'", flush=True)
-    was_shabbat = False
+    was_paused = False
     while True:
         # Publish which chats we're actively processing (throttled).
         if PRESENCE:
@@ -284,18 +350,54 @@ def main():
                 heartbeat_tick()
         items = get_outbox()
         shab = is_shabbat()
-        if not shab and was_shabbat:
-            # Shabbat just ended — allow a fresh heads-up next Shabbat and let the
+        tisha = in_tisha_beav()
+        paused = shab or tisha
+        if not paused and was_paused:
+            # Pause just ended — allow fresh heads-ups next time and let the
             # accumulated backlog flush through the normal path below.
             _shabbat_announced.clear()
-            print("[relay] Shabbat ended — flushing held messages", flush=True)
-        was_shabbat = shab
+            _tisha_announced.clear()
+            _tisha_replied.clear()
+            print("[relay] pause ended — flushing held messages", flush=True)
+        was_paused = paused
+        pause_exempt = _load_pause_exempt() if paused else frozenset()
         done = []
         held = 0
         state_cache = {}  # surface -> True/False/None, computed once per cycle
         for it in items:
             iid, surface, notice = it["id"], it["surface"], it["notice"]
             key = str(surface)
+
+            if paused and key.upper() not in pause_exempt:
+                # Shabbat / Tishá BeAv: HOLD everything until the window ends.
+                # On Tishá BeAv, auto-reply once per chat so the sender knows it's
+                # the fast — this MUST run regardless of whether Claude is open on
+                # the target surface. Give the session a one-time heads-up only when
+                # Claude IS open there.
+                if tisha:
+                    chat = _chat_jid_from_notice(notice)
+                    if chat and chat not in _tisha_replied:
+                        if send_whatsapp(chat, TISHA_REPLY):
+                            _tisha_replied.add(chat)
+                            print(f"[relay] Tishá BeAv auto-reply -> {chat}", flush=True)
+                if key not in state_cache:
+                    state_cache[key] = claude_running(surface)
+                if state_cache[key] is True:
+                    if shab and key not in _shabbat_announced:
+                        ann = ("\U0001F56F️ Shabat — Es Shabat ahora. Guardo los mensajes "
+                               "de WhatsApp y te los envio todos juntos al terminar Shabat "
+                               "(~%s). No respondas por WhatsApp hasta entonces."
+                               % shabbat_end_label())
+                        if send(surface, ann)[0]:
+                            _shabbat_announced.add(key)
+                            print(f"[relay] Shabbat notice -> {surface}", flush=True)
+                    if tisha and key not in _tisha_announced:
+                        if send(surface, TISHA_SESSION_ANN)[0]:
+                            _tisha_announced.add(key)
+                            print(f"[relay] Tishá BeAv notice -> {surface}", flush=True)
+                held += 1
+                continue
+
             if key not in state_cache:
                 state_cache[key] = claude_running(surface)
             state = state_cache[key]
@@ -321,22 +423,6 @@ def main():
                 held += 1
                 continue
 
-            if shab:
-                # Shabbat: HOLD every message until Havdalah. On the first held
-                # message for a surface (with Claude open), send a one-time notice
-                # so the session knows it's Shabbat and messages are being saved.
-                if key not in _shabbat_announced:
-                    ann = ("\U0001F56F️ Shabat — Es Shabat ahora. Guardo los mensajes "
-                           "de WhatsApp y te los envio todos juntos al terminar Shabat "
-                           "(~%s). No respondas por WhatsApp hasta entonces."
-                           % shabbat_end_label())
-                    ok, _ = send(surface, ann)
-                    if ok:
-                        _shabbat_announced.add(key)
-                        print(f"[relay] Shabbat notice -> {surface}", flush=True)
-                held += 1
-                continue
-
             ok, msg = send(surface, notice)
             if ok:
                 done.append(iid)
@@ -352,8 +438,12 @@ def main():
                     _attempts.pop(iid, None)
         ack(done)
         if held:
-            reason = ("Shabbat, hasta ~%s" % shabbat_end_label()) if shab \
-                else "Claude not open in target surface(s)"
+            if tisha:
+                reason = "Tishá BeAv, hasta ~1:00pm"
+            elif shab:
+                reason = "Shabbat, hasta ~%s" % shabbat_end_label()
+            else:
+                reason = "Claude not open in target surface(s)"
             print(f"[relay] holding {held} msg(s) — {reason}", flush=True)
         time.sleep(POLL_SECONDS)
 
