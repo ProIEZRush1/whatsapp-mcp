@@ -534,12 +534,15 @@ func loadPresenceConfig() {
 }
 
 // recordPeerMessage notes when ANY priority peer posts in a chat, so takeover can
-// tell whether a peer already answered.
-func recordPeerMessage(chatJID, sender string, ts time.Time) {
+// tell whether a peer already answered. In @lid-addressed groups the sender's
+// primary JID is a LID (not the phone number), so we ALSO match the alternate
+// address (senderAlt), which carries the phone number in those groups. Without
+// this, a peer's reply is never recognized and takeover wrongly fires.
+func recordPeerMessage(chatJID, sender, senderAlt string, ts time.Time) {
 	if presence == nil || len(peerNumberSet) == 0 {
 		return
 	}
-	if !peerNumberSet[onlyDigits(sender)] {
+	if !peerNumberSet[onlyDigits(sender)] && !peerNumberSet[onlyDigits(senderAlt)] {
 		return
 	}
 	peerLastMsg.Lock()
@@ -1427,7 +1430,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	senderName := senderDisplayName(client, msg)
 
 	// Note when the priority peer posts here, so takeover can tell if they answered.
-	recordPeerMessage(chatJID, sender, msg.Info.Timestamp)
+	recordPeerMessage(chatJID, sender, msg.Info.SenderAlt.User, msg.Info.Timestamp)
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, chatObj, chatJID, nil, sender, logger)
